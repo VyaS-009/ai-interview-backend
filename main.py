@@ -42,7 +42,7 @@ class SummaryRequest(BaseModel):
 # --- Middleware ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000","https://ai-interview-frontend-murex.vercel.app"],
+    allow_origins=["http://localhost:3000","https://ai-interview-frontend-murex.vercel.app", "https://ai-interview-nine-ochre.vercel.app"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
