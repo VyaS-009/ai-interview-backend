@@ -37,7 +37,9 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 6  # 6 hours token expiry time
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/token")
 
-DB_NAME = "interview_progress.db"
+# Use /tmp on Vercel for the writable path, otherwise use a local file.
+IS_VERCEL = os.getenv("VERCEL") == "1"
+DB_NAME = "/tmp/interview_progress.db" if IS_VERCEL else "interview_progress.db"
 
 def init_db():
        conn = sqlite3.connect(DB_NAME)
@@ -448,35 +450,6 @@ async def start_session(current_user: dict = Depends(get_current_user)):
            logger.error(f"Error creating session in DB: {e}", exc_info=True)
            raise HTTPException(status_code=500, detail="Could not create a new session.")
        return {"sessionId": session_id}
-
-@app.post("/save-question")
-async def save_question(request: SaveQuestionRequest, current_user: dict = Depends(get_current_user)):
-       try:
-           conn = sqlite3.connect(DB_NAME)
-           cursor = conn.cursor()
-
-           # --- SECURITY FIX: Verify session ownership ---
-           # Check if the provided session_id belongs to the current user
-           cursor.execute(
-               "SELECT user_id FROM sessions WHERE session_id = ?",
-               (request.sessionId,)
-           )
-           session_owner = cursor.fetchone()
-
-           if not session_owner or session_owner[0] != current_user['id']:
-               raise HTTPException(status_code=403, detail="Forbidden: You do not own this session.")
-           # --- END SECURITY FIX ---
-
-           cursor.execute(
-               "INSERT INTO progress (session_id, question, answer, score, justification) VALUES (?, ?, ?, ?, ?)",
-               (request.sessionId, request.question, request.answer, request.score, request.justification)
-           )
-           conn.commit()
-           conn.close()
-           return {"status": "success"}
-       except Exception as e:
-           logger.error(f"Error saving question progress: {e}", exc_info=True)
-           raise HTTPException(status_code=500, detail=f"Failed to save progress: {str(e)}")
 
 @app.post("/save-interview")
 async def save_interview(request: CompletedInterviewRequest, current_user: dict = Depends(get_current_user)):
