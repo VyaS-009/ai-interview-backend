@@ -10,7 +10,8 @@ import shutil
 import tempfile
 import logging
 import uuid
-import sqlite3
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from dotenv import load_dotenv
 from pydantic import BaseModel, EmailStr
 from typing import List, Optional
@@ -37,23 +38,24 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 6  # 6 hours token expiry time
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/token")
 
-# Use /tmp on Vercel for the writable path, otherwise use a local file.
-IS_VERCEL = os.getenv("VERCEL") == "1"
-DB_NAME = "/tmp/interview_progress.db" if IS_VERCEL else "interview_progress.db"
+try:
+    DATABASE_URL = os.environ['DATABASE_URL']
+except KeyError:
+    raise RuntimeError("DATABASE_URL environment variable not set. Please get it from your Neon project.")
 
 def init_db():
-       conn = sqlite3.connect(DB_NAME)
+       conn = psycopg2.connect(DATABASE_URL)
        cursor = conn.cursor()
        cursor.execute("""
            CREATE TABLE IF NOT EXISTS users (
-               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               id SERIAL PRIMARY KEY,
                email TEXT NOT NULL UNIQUE,
                hashed_password TEXT NOT NULL
            )
        """)
        cursor.execute("""
            CREATE TABLE IF NOT EXISTS sessions (
-               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               id SERIAL PRIMARY KEY,
                session_id TEXT NOT NULL UNIQUE,
                user_id INTEGER NOT NULL,
                name TEXT,
@@ -68,7 +70,7 @@ def init_db():
        """)
        cursor.execute("""
            CREATE TABLE IF NOT EXISTS progress (
-               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               id SERIAL PRIMARY KEY,
                session_id TEXT NOT NULL,
                question TEXT NOT NULL,
                answer TEXT NOT NULL,
@@ -138,13 +140,6 @@ class DetailedSummaryResponse(BaseModel):
     weakAreas: List[str]
     areasForImprovement: List[ImprovementArea]
 
-class SaveQuestionRequest(BaseModel):
-       sessionId: str
-       question: str
-       answer: str
-       score: int
-       justification: str
-
 class ChatHistoryItem(BaseModel):
     q: str
     a: str
@@ -205,18 +200,21 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
        encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
        return encoded_jwt
 
-def get_user(email: str):
-       conn = sqlite3.connect(DB_NAME)
-       conn.row_factory = sqlite3.Row
-       cursor = conn.cursor()
-       cursor.execute("SELECT * FROM users WHERE email = ?", (email,))
-       user = cursor.fetchone()
-       conn.close()
-       if user:
-           return dict(user)
-       return None
+# --- Database Dependency ---
+def get_db_conn():
+       conn = psycopg2.connect(DATABASE_URL)
+       try:
+           yield conn
+       finally:
+           conn.close()
 
-async def get_current_user(token: str = Depends(oauth2_scheme)):
+def get_user(email: str, conn: psycopg2.extensions.connection):
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    cursor.execute("SELECT * FROM users WHERE email = %s", (email,))
+    user = cursor.fetchone()
+    return dict(user) if user else None
+
+async def get_current_user(token: str = Depends(oauth2_scheme), conn: psycopg2.extensions.connection = Depends(get_db_conn)):
        credentials_exception = HTTPException(
            status_code=401,
            detail="Could not validate credentials",
@@ -231,27 +229,25 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
        except JWTError as e:
            logger.error(f"JWT Error: {e}")
            raise credentials_exception
-       user = get_user(email=token_data.email)
+       user = get_user(email=token_data.email, conn=conn)
        if user is None:
            raise credentials_exception
        return user
 
 @app.post("/auth/register", response_model=User)
-async def register_user(form_data: OAuth2PasswordRequestForm = Depends()):
-       db_user = get_user(email=form_data.username)
+async def register_user(form_data: OAuth2PasswordRequestForm = Depends(), conn: psycopg2.extensions.connection = Depends(get_db_conn)):
+       db_user = get_user(email=form_data.username, conn=conn)
        if db_user:
            raise HTTPException(status_code=400, detail="Email already registered")
        hashed_password = get_password_hash(form_data.password)
-       conn = sqlite3.connect(DB_NAME)
        cursor = conn.cursor()
-       cursor.execute("INSERT INTO users (email, hashed_password) VALUES (?, ?)", (form_data.username, hashed_password))
+       cursor.execute("INSERT INTO users (email, hashed_password) VALUES (%s, %s)", (form_data.username, hashed_password))
        conn.commit()
-       conn.close()
        return {"email": form_data.username}
 
 @app.post("/auth/token", response_model=Token)
-async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
-       user = get_user(email=form_data.username)
+async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), conn: psycopg2.extensions.connection = Depends(get_db_conn)):
+       user = get_user(email=form_data.username, conn=conn)
        if not user or not verify_password(form_data.password, user["hashed_password"]):
            raise HTTPException(status_code=401, detail="Incorrect email or password", headers={"WWW-Authenticate": "Bearer"})
        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
@@ -436,16 +432,13 @@ async def generate_summary(request: SummaryRequest, current_user: dict = Depends
 @app.post("/start-session", status_code=201)
 async def start_session(current_user: dict = Depends(get_current_user)):
        session_id = str(uuid.uuid4())
-       user_id = current_user['id']
        try:
-           conn = sqlite3.connect(DB_NAME)
-           cursor = conn.cursor()
-           cursor.execute(
-               "INSERT INTO sessions (session_id, user_id) VALUES (?, ?)",
-               (session_id, user_id)
-           )
-           conn.commit()
-           conn.close()
+            with psycopg2.connect(DATABASE_URL) as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "INSERT INTO sessions (session_id, user_id) VALUES (%s, %s)",
+                        (session_id, current_user['id'])
+                    )
        except Exception as e:
            logger.error(f"Error creating session in DB: {e}", exc_info=True)
            raise HTTPException(status_code=500, detail="Could not create a new session.")
@@ -455,60 +448,52 @@ async def start_session(current_user: dict = Depends(get_current_user)):
 async def save_interview(request: CompletedInterviewRequest, current_user: dict = Depends(get_current_user)):
     """Saves the completed interview details to the session."""
     try:
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
+        with psycopg2.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cursor:
+                # Security Check: Verify the session belongs to the current user
+                cursor.execute("SELECT user_id FROM sessions WHERE session_id = %s", (request.id,))
+                session_owner = cursor.fetchone()
 
-        # Security Check: Verify the session belongs to the current user
-        cursor.execute("SELECT user_id FROM sessions WHERE session_id = ?", (request.id,))
-        session_owner = cursor.fetchone()
+                if not session_owner or session_owner[0] != current_user['id']:
+                    raise HTTPException(status_code=403, detail="Forbidden: You do not own this session.")
 
-        if not session_owner or session_owner[0] != current_user['id']:
-            raise HTTPException(status_code=403, detail="Forbidden: You do not own this session.")
+                # Update the session with the final details
+                cursor.execute(
+                    """
+                    UPDATE sessions
+                    SET name = %s, email = %s, phone = %s, completed_at = %s, final_result = %s, job_role = %s, job_description = %s
+                    WHERE session_id = %s
+                    """,
+                    (request.name, request.email, request.phone, request.completedAt, request.finalResult.model_dump_json(), request.jobRole, request.jobDescription, request.id)
+                )
 
-        # Update the session with the final details
-        cursor.execute(
-            """
-            UPDATE sessions
-            SET name = ?, email = ?, phone = ?, completed_at = ?, final_result = ?, job_role = ?, job_description = ?
-            WHERE session_id = ?
-            """,
-            (request.name, request.email, request.phone, request.completedAt, request.finalResult.model_dump_json(), request.jobRole, request.jobDescription, request.id)
-        )
-
-        # --- FIX: Insert chat history into the progress table ---
-        for item in request.chatHistory:
-            cursor.execute(
-                "INSERT INTO progress (session_id, question, answer, evaluation) VALUES (?, ?, ?, ?)",
-                (request.id, item.q, item.a, item.evaluation.model_dump_json())
-            )
-        # --- END FIX ---
-
-        conn.commit()
-        conn.close()
+                # Insert chat history into the progress table
+                for item in request.chatHistory:
+                    cursor.execute(
+                        "INSERT INTO progress (session_id, question, answer, evaluation) VALUES (%s, %s, %s, %s)",
+                        (request.id, item.q, item.a, item.evaluation.model_dump_json())
+                    )
         return {"status": "success"}
     except Exception as e:
         logger.error(f"Error saving completed interview: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to save interview details: {str(e)}")
 
 @app.get("/interview-history", response_model=List[dict])
-async def get_interview_history(current_user: dict = Depends(get_current_user)):
+async def get_interview_history(current_user: dict = Depends(get_current_user), conn: psycopg2.extensions.connection = Depends(get_db_conn)):
     """
     Fetches all completed interview sessions and their details for the current user.
     """
     try:
-        with sqlite3.connect(DB_NAME) as conn:
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
-
+        with conn.cursor(cursor_factory=RealDictCursor) as cursor:
             # Fetch all completed sessions for the user
             cursor.execute(
                 """
                 SELECT session_id, name, email, phone, completed_at, final_result, job_role, job_description
                 FROM sessions
-                WHERE user_id = ? AND completed_at IS NOT NULL
+                WHERE user_id = %s AND completed_at IS NOT NULL
                 ORDER BY completed_at DESC
                 """,
-                (current_user['id'],)
+                (current_user['id'],),
             )
             sessions = [dict(row) for row in cursor.fetchall()]
 
@@ -518,7 +503,7 @@ async def get_interview_history(current_user: dict = Depends(get_current_user)):
             # For each session, fetch its chat history
             for session in sessions:
                 cursor.execute(
-                    "SELECT question as q, answer as a, evaluation FROM progress WHERE session_id = ?",
+                    "SELECT question as q, answer as a, evaluation FROM progress WHERE session_id = %s",
                     (session['session_id'],)
                 )
                 chat_history = [dict(row) for row in cursor.fetchall()]
