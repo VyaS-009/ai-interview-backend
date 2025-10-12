@@ -5,3 +5,7 @@ google-generativeai
 python-dotenv
 pypdf
 python-docx
+passlib
+python-jose[cryptography]
+pydantic[email]
+bcrypt==4.0.1
